@@ -56,8 +56,15 @@ function HamiltonianBlock(basis, kpoint, operators; scratch=nothing)
     end
 end
 function _ham_allocate_scratch(basis::PlaneWaveBasis{T}) where {T}
-    [(; ψ_reals=zeros_like(G_vectors(basis), complex(T), basis.fft_size...))
-     for _ = 1:Threads.nthreads()]
+    # For Non-collinear (:full), we need space for 2 spin components in real space
+    if basis.model.spin_polarization == :full
+        [(; ψ_real_up=zeros_like(G_vectors(basis), complex(T), basis.fft_size...),
+            ψ_real_dn=zeros_like(G_vectors(basis), complex(T), basis.fft_size...))
+         for _ = 1:Threads.nthreads()]
+    else
+        [(; ψ_reals=zeros_like(G_vectors(basis), complex(T), basis.fft_size...))
+         for _ = 1:Threads.nthreads()]
+    end
 end
 
 Base.:*(H::HamiltonianBlock, ψ) = mul!(similar(ψ), H, ψ)
@@ -133,33 +140,116 @@ end
     Hψ
 end
 
-# Fast version, specialized on DFT models. Minimizes the number of FFTs and allocations
+
+# CHANGED: Fast version, specialized on DFT models. Minimizes the number of FFTs and allocations
 @views @timing "DftHamiltonian multiplication" function LinearAlgebra.mul!(Hψ::AbstractArray,
-                                                                           H::DftHamiltonianBlock,
-                                                                           ψ::AbstractArray)
+                                                                          H::DftHamiltonianBlock,
+                                                                          ψ::AbstractArray)
     n_bands = size(ψ, 2)
     iszero(n_bands) && return Hψ  # Nothing to do if ψ empty
+
+    # === [MODIFICATION] Non-Collinear Logic Branch ===
+    if H.basis.model.spin_polarization == :full
+        # 1. Kinetic Term (Apply diagonal k^2/2 to both spinor components)
+        n_G = length(H.fourier_op.multiplier)
+        Hψ[1:n_G, :]       .+= H.fourier_op.multiplier .* ψ[1:n_G, :]
+        Hψ[n_G+1:2*n_G, :] .+= H.fourier_op.multiplier .* ψ[n_G+1:2*n_G, :]
+
+        # 2. Local Potential (Matrix Application)
+        # Potential is (Nx, Ny, Nz, 4) -> [Veff, Bx, By, Bz]
+        pot = H.local_op.potential
+        fft_scale = H.basis.fft_grid.fft_normalization * H.basis.fft_grid.ifft_normalization
+
+        # [FIX] Safe potential access without ternary macro issues
+        # Check if we have 4 components (Vector potential) or just 1/3D (Scalar potential)
+        if ndims(pot) == 4 && size(pot, 4) == 4
+            V_eff = view(pot, :, :, :, 1)
+            Bx    = view(pot, :, :, :, 2)
+            By    = view(pot, :, :, :, 3)
+            Bz    = view(pot, :, :, :, 4)
+        elseif ndims(pot) == 4
+            # 4D array but likely only 1 component (Collinear case treated as Scalar)
+            V_eff = view(pot, :, :, :, 1)
+            Bx = nothing; By = nothing; Bz = nothing
+        else
+            # 3D scalar array
+            V_eff = pot
+            Bx = nothing; By = nothing; Bz = nothing
+        end
+
+        parallel_loop_over_range(1:n_bands, H.scratch) do iband, storage
+             # Unpack Spinors
+             ψ_up_G = ψ[1:n_G, iband]
+             ψ_dn_G = ψ[n_G+1:2*n_G, iband]
+             
+             # IFFT to Real Space
+             # We use the scratch buffers allocated in _ham_allocate_scratch
+             ψ_r_up = storage.ψ_real_up
+             ψ_r_dn = storage.ψ_real_dn
+             
+             ifft!(ψ_r_up, H.basis, H.kpoint, ψ_up_G; normalize=false)
+             ifft!(ψ_r_dn, H.basis, H.kpoint, ψ_dn_G; normalize=false)
+             
+             if Bx === nothing
+                 # --- Scalar Potential Optimization (B=0) ---
+                 for i in eachindex(ψ_r_up)
+                     v = V_eff[i] * fft_scale
+                     ψ_r_up[i] *= v
+                     ψ_r_dn[i] *= v
+                 end
+             else
+                 # --- Full SOC Potential (V + sigma.B) ---
+                 for i in eachindex(ψ_r_up)
+                     v  = V_eff[i] * fft_scale
+                     bx = Bx[i]    * fft_scale
+                     by = By[i]    * fft_scale
+                     bz = Bz[i]    * fft_scale
+                     
+                     u = ψ_r_up[i]
+                     d = ψ_r_dn[i]
+                     
+                     # Pauli Matrix Multiply
+                     # [ V+Bz   Bx-iBy ] [ u ]
+                     # [ Bx+iBy V-Bz   ] [ d ]
+                     ψ_r_up[i] = (v + bz) * u + (bx - im*by) * d
+                     ψ_r_dn[i] = (bx + im*by) * u + (v - bz) * d
+                 end
+             end
+
+             # FFT back to G-space and Accumulate
+             # We reuse the Hψ slice as the destination
+             fft!(Hψ[1:n_G, iband],       H.basis, H.kpoint, ψ_r_up; normalize=false)
+             fft!(Hψ[n_G+1:2*n_G, iband], H.basis, H.kpoint, ψ_r_dn; normalize=false)
+        end
+
+        # 3. Nonlocal Operator (Pseudopotentials)
+        if !isnothing(H.nonlocal_op)
+            apply!((; fourier=Hψ, real=nothing),
+                   H.nonlocal_op,
+                   (; fourier=ψ, real=nothing))
+        end
+
+        return Hψ
+    end 
+    # === [END MODIFICATION] ===
+
+    # --- EXISTING CODE FOR COLLINEAR/SCALAR ---
     have_divAgrad = !isnothing(H.divAgrad_op)
     if have_divAgrad
-        # TODO: It is very beneficial to precompute G_plus_k here, rather than for each band.
-        #       Extra performance could probably be gained by storing this in the HamiltonianBlock
-        #       as a scratch array. Is it worth the complication and extra memory use?
-        # Precompute G_plus_k for DivAgradOperator
         G_plus_k = [map(p -> p[α], Gplusk_vectors_cart(H.basis, H.kpoint)) for α = 1:3]
     end
 
-    # Notice that we use unnormalized plans for extra speed
     potential = H.local_op.potential .* H.basis.fft_grid.fft_normalization .*
                 H.basis.fft_grid.ifft_normalization
 
     parallel_loop_over_range(1:n_bands, H.scratch) do iband, storage
-        to = TimerOutput()  # Thread-local timer output
+        to = TimerOutput() 
         ψ_real = storage.ψ_reals
 
         @timeit to "local" begin
             ifft!(ψ_real, H.basis, H.kpoint, ψ[:, iband]; normalize=false)
             ψ_real .*= potential
-            fft!(Hψ[:, iband], H.basis, H.kpoint, ψ_real; normalize=false)  # overwrites ψ_real
+            fft!(Hψ[:, iband], H.basis, H.kpoint, ψ_real; normalize=false) 
         end
 
         if have_divAgrad
@@ -167,7 +257,7 @@ end
                 apply!((; fourier=Hψ[:, iband], real=nothing),
                        H.divAgrad_op,
                        (; fourier=ψ[:, iband], real=nothing);
-                       ψ_real, G_plus_k) # overwrites ψ_real
+                       ψ_real, G_plus_k) 
             end
         end
 
@@ -176,10 +266,8 @@ end
         end
     end
 
-    # Kinetic term
     Hψ .+= H.fourier_op.multiplier .* ψ
 
-    # Apply the nonlocal operator.
     if !isnothing(H.nonlocal_op)
         @timing "nonlocal" begin
             apply!((; fourier=Hψ, real=nothing),
@@ -190,7 +278,6 @@ end
 
     Hψ
 end
-
 
 """
 Get energies and Hamiltonian

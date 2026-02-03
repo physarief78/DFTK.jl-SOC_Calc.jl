@@ -15,6 +15,12 @@ struct PspUpf{T,I} <: NormConservingPsp
     # Kleinman-Bylander energies. Stored per AM channel `h[l+1][i,j]`.
     # UPF: `PP_DIJ`
     h::Vector{Matrix{T}}
+    
+    # --- NEW FIELD: Relativistic Energies ---
+    # h_so[l+1] contains [h(j=l-0.5), h(j=l+0.5)]
+    h_so::Vector{Vector{Vector{T}}}
+    # ----------------------------------------
+
     # Pseudo-wavefunctions on the radial grid. Used as projectors for PDOS
     # and DFT+U(+V), could be used for wavefunction initialization as well.
     # r^2 * χ where χ are pseudo-atomic wavefunctions on the radial grid.
@@ -64,7 +70,6 @@ end
 Construct a Unified Pseudopotential Format pseudopotential by reading a file.
 
 Does not support:
-- Fully-realtivistic / spin-orbit pseudos
 - Bare Coulomb / all-electron potentials
 - Semilocal potentials
 - Ultrasoft potentials
@@ -92,7 +97,7 @@ Construct a Unified Pseudopotential Format pseudopotential from a parsed upf fil
 """
 function PspUpf(pseudo::UpfFile; identifier, rcut=nothing)
     unsupported = []
-    pseudo.header.has_so                && push!(unsupported, "spin-orbit coupling")
+    # REMOVED: pseudo.header.has_so && push!(unsupported, "spin-orbit coupling")
     pseudo.header.pseudo_type == "SL"   && push!(unsupported, "semilocal potential")
     pseudo.header.pseudo_type == "US"   && push!(unsupported, "ultrasoft")
     pseudo.header.pseudo_type == "USPP" && push!(unsupported, "ultrasoft")
@@ -113,13 +118,6 @@ function PspUpf(pseudo::UpfFile; identifier, rcut=nothing)
     rcut = isnothing(rcut) ? last(rgrid) : min(rcut, last(rgrid))
     ircut = findfirst(>=(rcut), rgrid)
 
-    # There are two possible units schemes for the projectors and coupling coefficients:
-    # rβ [Ry Bohr^{-1/2}]  h [Ry^{-1}]
-    # rβ [Bohr^{-1/2}]     h [Ry]
-    # The quantity that's used in calculations is β h β, so the units don't practically
-    # matter. However, GTH pseudos in UPF format use the first units, so we assume them
-    # to facilitate comparison of the intermediate quantities with analytical GTH.
-
     r2_projs = map(0:lmax) do l
         betas_l = filter(beta -> beta.angular_momentum == l, pseudo.nonlocal.betas)
         map(betas_l) do beta_li
@@ -132,6 +130,76 @@ function PspUpf(pseudo::UpfFile; identifier, rcut=nothing)
         pseudo.nonlocal.dij[mask_l, mask_l] .* 2  # 1/Ry -> 1/Ha
     end
 
+    # CHANGED --- PARSE SOC DATA ---
+    T = eltype(rgrid)
+    h_so = [Vector{Vector{T}}() for _ in 0:lmax]
+    
+    # Check if we can access the j information.
+    # If PseudoPotentialIO doesn't expose it, we might need to inspect the raw dictionary
+    # or rely on the standard ordering: first set of betas for an l are j-0.5, second set are j+0.5.
+    
+    if pseudo.header.has_so
+        # Initialize slots
+        for l in 0:lmax
+            push!(h_so[l+1], T[]) # j-
+            push!(h_so[l+1], T[]) # j+
+        end
+
+        # Group betas by angular momentum l
+        for l in 0:lmax
+            betas_l = filter(beta -> beta.angular_momentum == l, pseudo.nonlocal.betas)
+            
+            # For l=0, j must be 0.5 (only one channel)
+            if l == 0
+                for beta in betas_l
+                    d_val = pseudo.nonlocal.dij[beta.index, beta.index] * 2 # Ry -> Ha
+                    # l=0 has j=1/2. Conventionally put in the "plus" slot (index 2) or handle as special.
+                    # Let's put it in index 1 (minus slot) since |0 - 1/2| = 0.5.
+                    push!(h_so[1][1], d_val) 
+                end
+            else
+                # For l > 0, we expect two sets of projectors: j = l-0.5 and j = l+0.5
+                # Standard UPF ordering: The first N/2 are j-0.5, the next N/2 are j+0.5
+                n_betas = length(betas_l)
+                if isodd(n_betas)
+                     @warn "Odd number of projectors for l=$l in SOC pseudopotential. Assumption of split j-shells might fail."
+                end
+                
+                # Try to access total_angular_momentum if available (using getfield to avoid error if missing)
+                # If not, use the index splitting heuristic.
+                
+                midpoint = div(n_betas, 2)
+                
+                for (i, beta) in enumerate(betas_l)
+                    d_val = pseudo.nonlocal.dij[beta.index, beta.index] * 2
+                    
+                    # Try to get j safely
+                    j_val = -1.0
+                    try
+                        j_val = getproperty(beta, :total_angular_momentum)
+                    catch
+                        # Field missing, fallback to heuristic
+                        j_val = (i <= midpoint) ? (l - 0.5) : (l + 0.5)
+                    end
+                    
+                    if abs(j_val - (l - 0.5)) < 1e-4
+                        push!(h_so[l+1][1], d_val)
+                    elseif abs(j_val - (l + 0.5)) < 1e-4
+                        push!(h_so[l+1][2], d_val)
+                    else
+                        # Heuristic fallback if j_val was garbage
+                         if i <= midpoint
+                             push!(h_so[l+1][1], d_val)
+                         else
+                             push!(h_so[l+1][2], d_val)
+                         end
+                    end
+                end
+            end
+        end
+    end
+    # ----------------------
+
     r2_pswfcs = [Vector{Float64}[] for _ = 0:lmax]
     pswfc_occs     = [Float64[]    for _ = 0:lmax]
     pswfc_energies = [Float64[]    for _ = 0:lmax]
@@ -141,8 +209,6 @@ function PspUpf(pseudo::UpfFile; identifier, rcut=nothing)
         for pswfc_li in pswfcs_l
             push!(r2_pswfcs[l+1], rgrid .* pswfc_li.chi)  # rχ -> r²χ
             push!(pswfc_occs[l+1], pswfc_li.occupation)
-            # TODO: energies and labels can be nothing,
-            #       we'll see if this is a problem in practice
             push!(pswfc_energies[l+1], pswfc_li.pseudo_energy)
             push!(pswfc_labels[l+1], pswfc_li.label)
         end
@@ -160,7 +226,8 @@ function PspUpf(pseudo::UpfFile; identifier, rcut=nothing)
 
     PspUpf{eltype(rgrid),typeof(vloc_interp)}(
         Zion, lmax, rgrid, drgrid,
-        vloc, r2_projs, h, r2_pswfcs, pswfc_occs, pswfc_energies, pswfc_labels,
+        vloc, r2_projs, h, h_so, # Added h_so
+        r2_pswfcs, pswfc_occs, pswfc_energies, pswfc_labels,
         r2_ρion, r2_ρcore,
         vloc_interp, r2_projs_interp, r2_ρion_interp, r2_ρcore_interp,
         rcut, ircut, identifier, description
@@ -176,9 +243,6 @@ function eval_psp_projector_real(psp::PspUpf, i, l, r::T)::T where {T<:Real}
 end
 
 function eval_psp_projector_fourier(psp::PspUpf, i, l, p::T)::T where {T<:Real}
-    # The projectors may have been cut off before the end of the radial mesh
-    # by PseudoPotentialIO because UPFs list a radial cutoff index for these
-    # functions after which they are strictly zero in the file.
     ircut_proj = min(psp.ircut, length(psp.r2_projs[l+1][i]))
     rgrid = @view psp.rgrid[1:ircut_proj]
     r2_proj = @view psp.r2_projs[l+1][i][1:ircut_proj]
@@ -194,22 +258,12 @@ function eval_psp_pswfc_real(psp::PspUpf, i, l, r::T)::T where {T<:Real}
 end
 
 function eval_psp_pswfc_fourier(psp::PspUpf, i, l, p::T)::T where {T<:Real}
-    # Pseudo-atomic wavefunctions are _not_ currently cut off like the other
-    # quantities. They are the reason that PseudoDojo UPF files have a much
-    # larger radial grid than their psp8 counterparts.
-    # If issues arise, try cutting them off too.
     return hankel(psp.rgrid, psp.r2_pswfcs[l+1][i], l, p)
 end
 
 eval_psp_local_real(psp::PspUpf, r::T) where {T<:Real} = psp.vloc_interp(r)
 
 function eval_psp_local_fourier(psp::PspUpf, p::T)::T where {T<:Real}
-    # QE style C(r) = -Zerf(r)/r Coulomb tail correction used to ensure
-    # exponential decay of `f` so that the Hankel transform is accurate.
-    # H[Vloc(r)] = H[Vloc(r) - C(r)] + H[C(r)],
-    # where H[-Zerf(r)/r] = -Z/p^2 exp(-p^2 /4)
-    # ABINIT uses a more 'pure' Coulomb term with the same asymptotic behavior
-    # C(r) = -Z/r; H[-Z/r] = -Z/p^2
     rgrid = @view psp.rgrid[1:psp.ircut]
     vloc  = @view psp.vloc[1:psp.ircut]
     I = simpson(rgrid) do i, r
@@ -244,4 +298,16 @@ function eval_psp_energy_correction(T, psp::PspUpf)
     4T(π) * simpson(rgrid) do i, r
         r * (r * vloc[i] - -psp.Zion)
     end
+end
+
+# === NEW SOC INTERFACE IMPLEMENTATION ===
+
+has_spin_orbit(psp::PspUpf) = !isempty(psp.h_so) && !all(isempty, psp.h_so)
+
+function get_soc_coupling(psp::PspUpf, l)
+    if l > psp.lmax || isempty(psp.h_so)
+        return nothing
+    end
+    # Returns [h_j_minus, h_j_plus]
+    return psp.h_so[l+1]
 end

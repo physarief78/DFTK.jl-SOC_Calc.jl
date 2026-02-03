@@ -6,6 +6,7 @@ that really does the work, operating on a single ``k``-Block.
 `eigensolver` should support the API `eigensolver(A, X0; prec, tol, maxiter)`
 `prec_type` should be a function that returns a preconditioner when called as `prec(ham, kpt)`
 """
+# ------------- CHANGED: ADDED THE SOC CAPABLE CALCULATION FOR spin_polarization = :full-----------------
 function diagonalize_all_kblocks(eigensolver, ham::Hamiltonian, nev_per_kpoint::Int;
                                  ψguess=nothing,
                                  prec_type=PreconditionerTPA, interpolate_kpoints=true,
@@ -13,17 +14,26 @@ function diagonalize_all_kblocks(eigensolver, ham::Hamiltonian, nev_per_kpoint::
     kpoints = ham.basis.kpoints
     results = Vector{Any}(undef, length(kpoints))
 
+    # CHANGED: [FIX] Determine spinor multiplier
+    # If SOC is active (:full), wavefunctions have 2 components per G-vector.
+    n_spinors = ham.basis.model.spin_polarization == :full ? 2 : 1
+
     for (ik, kpt) in enumerate(kpoints)
-        n_Gk = length(G_vectors(ham.basis, kpt))
-        if n_Gk < nev_per_kpoint
-            error("The size of the plane wave basis is $n_Gk, and you are asking for " *
+        # Calculate true matrix dimension (rows)
+        n_Gk_scalar = length(G_vectors(ham.basis, kpt))
+        n_rows = n_Gk_scalar * n_spinors
+
+        if n_rows < nev_per_kpoint
+            error("The size of the basis ($n_rows) is smaller than the " *
                   "$nev_per_kpoint eigenvalues. Increase Ecut.")
         end
+
         # Get ψguessk
         if !isnothing(ψguess)
-            if n_Gk != size(ψguess[ik], 1)
-                error("Mismatch in dimension between guess ($(size(ψguess[ik], 1)) and " *
-                      "Hamiltonian ($n_Gk)")
+            # [FIX] Check against n_rows, not just scalar n_Gk
+            if n_rows != size(ψguess[ik], 1)
+                error("Mismatch in dimension between guess ($(size(ψguess[ik], 1))) and " *
+                      "Hamiltonian ($n_rows)")
             end
             nev_guess = size(ψguess[ik], 2)
             if nev_guess > nev_per_kpoint
@@ -31,9 +41,9 @@ function diagonalize_all_kblocks(eigensolver, ham::Hamiltonian, nev_per_kpoint::
             elseif nev_guess == nev_per_kpoint
                 ψguessk = ψguess[ik]
             else
-                X0 = similar(ψguess[ik], n_Gk, nev_per_kpoint)
+                X0 = similar(ψguess[ik], n_rows, nev_per_kpoint)
                 X0[:, 1:nev_guess] = ψguess[ik]
-                X0[:, nev_guess+1:end] = randn(eltype(X0), n_Gk, nev_per_kpoint - nev_guess)
+                X0[:, nev_guess+1:end] = randn(eltype(X0), n_rows, nev_per_kpoint - nev_guess)
                 ψguessk = ortho_qr(X0)
             end
         elseif interpolate_kpoints && ik > 1
@@ -43,7 +53,9 @@ function diagonalize_all_kblocks(eigensolver, ham::Hamiltonian, nev_per_kpoint::
         else
             ψguessk = random_orbitals(ham.basis, kpt, nev_per_kpoint)
         end
-        @assert size(ψguessk) == (n_Gk, nev_per_kpoint)
+        
+        # [FIX] Final assertion uses n_rows
+        @assert size(ψguessk) == (n_rows, nev_per_kpoint)
 
         prec = nothing
         !isnothing(prec_type) && (prec = prec_type(ham[ik]))
@@ -56,7 +68,7 @@ function diagonalize_all_kblocks(eigensolver, ham::Hamiltonian, nev_per_kpoint::
     #      Better have this handled by the caller of diagonalize_all_kblocks.
     #      Note further that lobpcg_hyper by default puts the eigenvalues
     #      on the CPU ... even if the next line is removed.
-    (; λ=[to_cpu(real.(res.λ)) for res in results],  # Always get onto the CPU
+    (; λ=[to_cpu(real.(res.λ)) for res in results], # Always get onto the CPU
      X=[res.X for res in results],
      residual_norms=[res.residual_norms for res in results],
      n_iter=[res.n_iter for res in results],

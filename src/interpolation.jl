@@ -93,6 +93,7 @@ end
 Interpolate some data from one ``k``-point to another. The interpolation is fast, but not
 necessarily exact. Intended only to construct guesses for iterative solvers.
 """
+# CHANGED: To apply the SOC and :full spin_polarization calculation
 function interpolate_kpoint(data_in::AbstractVecOrMat,
                             basis_in::PlaneWaveBasis,  kpoint_in::Kpoint,
                             basis_out::PlaneWaveBasis, kpoint_out::Kpoint)
@@ -100,16 +101,43 @@ function interpolate_kpoint(data_in::AbstractVecOrMat,
     if kpoint_in == kpoint_out
         return copy(data_in)
     end
-    @assert length(G_vectors(basis_in, kpoint_in)) == size(data_in, 1)
 
-    n_bands  = size(data_in, 2)
-    n_Gk_out = length(G_vectors(basis_out, kpoint_out))
-    data_out = similar(data_in, n_Gk_out, n_bands) .= 0
+    # [FIX] Handle SOC (Spinors)
+    n_spinors = basis_in.model.spin_polarization == :full ? 2 : 1
+    
+    n_G_in  = length(G_vectors(basis_in, kpoint_in))
+    n_G_out = length(G_vectors(basis_out, kpoint_out))
+    
+    # [FIX] Assertion must account for spinor size
+    @assert size(data_in, 1) == n_G_in * n_spinors
 
+    n_bands = size(data_in, 2)
+    
+    # [FIX] Allocate output with correct spinor size
+    data_out = similar(data_in, n_G_out * n_spinors, n_bands)
+    fill!(data_out, 0)
+
+    # Buffer for global G-vector mapping (scalar size is sufficient per component)
     max_nG = max(length(G_vectors(basis_in)), length(G_vectors(basis_out)))
-    tmp = similar(data_in, max_nG, n_bands) .= 0
+    tmp = similar(data_in, max_nG, n_bands)
 
-    tmp[kpoint_in.mapping, :] .= data_in
-    data_out .= @view tmp[kpoint_out.mapping, :]
+    # Iterate over spinor components (1 for Scalar, 2 for SOC)
+    for i_spin = 1:n_spinors
+        # Define ranges for the current spinor component
+        # Component 1: 1:nG, Component 2: nG+1:2nG
+        range_in  = (1 + (i_spin-1)*n_G_in) : (i_spin*n_G_in)
+        range_out = (1 + (i_spin-1)*n_G_out) : (i_spin*n_G_out)
+        
+        # 1. Clear buffer
+        fill!(tmp, 0)
+        
+        # 2. Scatter input to global grid (tmp) using input mapping
+        # We view the specific component slice of data_in
+        tmp[kpoint_in.mapping, :] .= view(data_in, range_in, :)
+        
+        # 3. Gather from global grid (tmp) to output using output mapping
+        data_out[range_out, :] .= view(tmp, kpoint_out.mapping, :)
+    end
+
     ortho_qr(data_out)  # Re-orthogonalize and renormalize
 end

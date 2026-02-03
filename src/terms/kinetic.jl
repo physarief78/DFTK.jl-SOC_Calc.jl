@@ -39,23 +39,32 @@ end
 
 @timing "ene_ops: kinetic" function ene_ops(term::TermKinetic, basis::PlaneWaveBasis{T},
                                             ψ, occupation; kwargs...) where {T}
+    # These operators are scalar (size Ng). 
+    # The Hamiltonian.jl mul! logic handles applying them to Spinors manually.
     ops = [FourierMultiplication(basis, kpoint, term.kinetic_energies[ik])
            for (ik, kpoint) in enumerate(basis.kpoints)]
+           
     if isnothing(ψ) || isnothing(occupation)
         return (; E=T(Inf), ops)
     end
 
     E = zero(T)
     for (ik, ψk) in enumerate(ψ)
-        E += basis.kweights[ik] * 
-             sum(occupation[ik] .* 
-                 real(vec(columnwise_dots(ψk, Diagonal(term.kinetic_energies[ik]), ψk))))
+        # [FIX] SOC Support
+        # ψk is (2*Ng, bands) for SOC, but kinetic_energies[ik] is (Ng).
+        # We must duplicate the kinetic energy diagonal to match the spinor size
+        # so that columnwise_dots (generic LinearAlgebra) works.
+        kin = term.kinetic_energies[ik]
+        if basis.model.spin_polarization == :full
+            kin = vcat(kin, kin)
+        end
+
+        E += basis.kweights[ik] * sum(occupation[ik] .* real(vec(columnwise_dots(ψk, Diagonal(kin), ψk))))
     end
     E = mpi_sum(E, basis.comm_kpts)
 
     (; E, ops)
 end
-
 
 """
 Default blow-up corresponding to the standard kinetic energies.

@@ -31,6 +31,26 @@ abstract type NormConservingPsp end
 # count_n_pswfc_radial(psp, l::Integer)
 # pswfc_label(psp, i::Integer, l::Integer)
 
+
+# === NEW SOC METHODS (Defined at top level) ===
+
+"""
+    has_spin_orbit(psp)
+Returns `true` if the pseudopotential contains spin-orbit coupling data 
+(i.e., distinct projectors for j = l - 1/2 and j = l + 1/2).
+"""
+has_spin_orbit(psp::NormConservingPsp) = false
+
+"""
+    get_soc_coupling(psp, l)
+Returns the relativistic coupling coefficients for angular momentum `l`.
+Should return a vector of two vectors: `[h_minus, h_plus]`.
+- `h_minus`: Coefficients for j = l - 1/2
+- `h_plus`:  Coefficients for j = l + 1/2
+Returns `nothing` if SOC data is not available for this l.
+"""
+get_soc_coupling(psp::NormConservingPsp, l) = nothing
+
 """
     eval_psp_projector_real(psp, i, l, r)
 

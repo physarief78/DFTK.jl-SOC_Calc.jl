@@ -79,8 +79,21 @@ function unsafe_unpack_ψ(x, sizes_ψ)
 end
 unpack_ψ(x, sizes_ψ) = deepcopy(unsafe_unpack_ψ(x, sizes_ψ))
 
+# CHANGED: === MODIFIED: Added SOC Support ===
 function random_orbitals(basis::PlaneWaveBasis{T}, kpt::Kpoint, howmany::Integer) where {T}
-    orbitals = similar(G_vectors(basis), Complex{T}, length(G_vectors(basis, kpt)), howmany)
+    # Check if we are running in full spin mode (Non-Collinear/SOC)
+    if basis.model.spin_polarization == :full
+        n_spinors = 2
+    else
+        n_spinors = 1
+    end
+
+    n_G = length(G_vectors(basis, kpt))
+    
+    # Allocate memory: (n_spinors * n_G) rows.
+    # This ensures the wavefunction is large enough for the 2x2 Hamiltonian.
+    orbitals = similar(G_vectors(basis), Complex{T}, n_spinors * n_G, howmany)
+    
     randn!(TaskLocalRNG(), orbitals)  # use the RNG on the device if we're using a GPU
     ortho_qr(orbitals)
 end

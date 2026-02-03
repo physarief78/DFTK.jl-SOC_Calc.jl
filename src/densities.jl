@@ -18,36 +18,66 @@ using an optional `occupation_threshold`. By default all occupation numbers are 
                 for occk in occupation]
 
     function allocate_local_storage()
-        # The types were moved inside here to avoid a type instability,
-        # as it seems that captures over types do not get specialized!
-        Tρ = promote_type(T,  real(eltype(ψ[1])))
-        # Note, that we special-case Tψ, since when T is Dual and eltype(ψ[1]) is not
-        # (e.g. stress calculation), then only the normalisation factor introduces
-        # dual numbers, but not yet the FFT
+        Tρ = promote_type(T, real(eltype(ψ[1])))
         Tψ = promote_type(VT, real(eltype(ψ[1])))
-
-        (; ρ=zeros_like(G_vectors(basis), Tρ, basis.fft_size..., basis.model.n_spin_components),
-         ψnk_real=zeros_like(G_vectors(basis), complex(Tψ), basis.fft_size...))
+        
+        # Temp buffers for spinors
+        tmp_real = zeros(complex(Tψ), basis.fft_size...)
+        
+        if basis.model.spin_polarization == :full
+             tmp_real_2 = zeros(complex(Tψ), basis.fft_size...)
+             return (; ρ=zeros(Tρ, basis.fft_size..., basis.model.n_spin_components),
+                      ψnk_real=tmp_real, ψnk_real_2=tmp_real_2)
+        else
+             return (; ρ=zeros(Tρ, basis.fft_size..., basis.model.n_spin_components),
+                      ψnk_real=tmp_real)
+        end
     end
-    # We split the total iteration range (ik, n) in chunks, and parallelize over them.
+
     range = [(ik, n) for ik = 1:length(basis.kpoints) for n = mask_occ[ik]]
 
     storages = parallel_loop_over_range(range; allocate_local_storage) do kn, storage
         (ik, n) = kn
         kpt = basis.kpoints[ik]
-        ifft!(storage.ψnk_real, basis, kpt, ψ[ik][:, n]; normalize=false)
-        storage.ρ[:, :, :, kpt.spin] .+= (occupation[ik][n] .* basis.kweights[ik]
-                                          .* (basis.fft_grid.ifft_normalization)^2
-                                          .* abs2.(storage.ψnk_real))
-
+        
+        # === SOC / Non-Collinear Logic ===
+        if basis.model.spin_polarization == :full
+            n_G = length(G_vectors(basis, kpt))
+            
+            # 1. Extract and FFT Up component (normalize=false to match weight logic)
+            ifft!(storage.ψnk_real, basis, kpt, ψ[ik][1:n_G, n]; normalize=false)
+            
+            # 2. Extract and FFT Down component
+            ifft!(storage.ψnk_real_2, basis, kpt, ψ[ik][n_G+1:end, n]; normalize=false)
+            
+            # 3. Accumulate Density Components (n, mx, my, mz)
+            # Apply normalization: (ifft_norm)^2
+            norm_fac = (basis.fft_grid.ifft_normalization)^2
+            weight = occupation[ik][n] * basis.kweights[ik] * norm_fac
+            
+            ψu = storage.ψnk_real
+            ψd = storage.ψnk_real_2
+            
+            @. begin
+                storage.ρ[:, :, :, 1] += weight * (abs2(ψu) + abs2(ψd))        # Total Charge n
+                storage.ρ[:, :, :, 2] += weight * 2 * real(conj(ψu) * ψd)      # Mx
+                storage.ρ[:, :, :, 3] += weight * 2 * imag(conj(ψu) * ψd)      # My
+                storage.ρ[:, :, :, 4] += weight * (abs2(ψu) - abs2(ψd))        # Mz
+            end
+            
+        else
+            # === Scalar/Collinear Logic ===
+            ifft!(storage.ψnk_real, basis, kpt, ψ[ik][:, n]; normalize=false)
+            storage.ρ[:, :, :, kpt.spin] .+= (occupation[ik][n] .* basis.kweights[ik]
+                                              .* (basis.fft_grid.ifft_normalization)^2
+                                              .* abs2.(storage.ψnk_real))
+        end
     end
+    
     ρ = sum(storage -> storage.ρ, storages)
-
     mpi_sum!(ρ, basis.comm_kpts)
     ρ = symmetrize_ρ(basis, ρ; do_lowpass=false)
 
-    # There can always be small negative densities, e.g. due to numerical fluctuations
-    # in a vacuum region, so put some tolerance even if occupation_threshold == 0
     negtol = max(sqrt(eps(T)), 10occupation_threshold)
     minimum(ρ) < -negtol && @warn("Negative ρ detected", min_ρ=minimum(ρ))
 
@@ -118,30 +148,85 @@ end
     symmetrize_ρ(basis, τ; do_lowpass=false)
 end
 
-total_density(ρ) = dropdims(sum(ρ; dims=4); dims=4)
+# Modified total_density(ρ) to enable the :full calculation
+function total_density(ρ)
+    if size(ρ, 4) == 4
+        # For :full, the first component is already the total density
+        return ρ[:, :, :, 1]
+    else
+        # For :collinear (2) or :spinless (1), sum is correct
+        return dropdims(sum(ρ; dims=4); dims=4)
+    end
+end
+# Modified spin_density(ρ) to match the modified :full calculation support
 @views function spin_density(ρ)
     if size(ρ, 4) == 2
-        ρ[:, :, :, 1] - ρ[:, :, :, 2]
+        return ρ[:, :, :, 1] - ρ[:, :, :, 2]
+    elseif size(ρ, 4) == 4
+        # Return magnitude of magnetization vector |M|
+        return sqrt.(abs2.(ρ[:, :, :, 2]) .+ abs2.(ρ[:, :, :, 3]) .+ abs2.(ρ[:, :, :, 4]))
     else
-        zero(ρ[:, :, :])
+        return zero(ρ[:, :, :])
     end
 end
 
+# Modified to allow the spin_polarization = :full calculation
 function ρ_from_total_and_spin(ρtot, ρspin=nothing)
     if ρspin === nothing
-        # Val used to ensure inferability
-        cat(ρtot; dims=Val(4))  # copy for consistency with other case
+        # Spinless / None
+        return cat(ρtot; dims=Val(4))
+        
+    elseif ρspin isa AbstractArray && size(ρtot) == size(ρspin)
+        # Collinear case: Construct (Up, Down)
+        # ρspin is treated as Magnetization Magnitude (Mz)
+        return cat((ρtot .+ ρspin) ./ 2,
+                   (ρtot .- ρspin) ./ 2; dims=Val(4))
+                   
+    elseif (ρspin isa Tuple || ρspin isa AbstractVector) && length(ρspin) == 3
+        # Full / Non-collinear case: Construct (n, Mx, My, Mz)
+        # We expect ρspin = (Mx, My, Mz)
+        mx, my, mz = ρspin
+        return cat(ρtot, mx, my, mz; dims=Val(4))
+        
     else
-        cat((ρtot .+ ρspin) ./ 2,
-            (ρtot .- ρspin) ./ 2; dims=Val(4))
+        error("Invalid input for density reconstruction. " * "For :collinear pass a single array (Mz). " * "For :full pass a tuple of 3 arrays (Mx, My, Mz).")
     end
 end
 
+# === CRITICAL FUNCTION FOR INITIALIZATION ===
 function ρ_from_total(basis, ρtot::AbstractArray{T}) where {T}
-    if basis.model.spin_polarization in (:none, :spinless)
+    model = basis.model
+    if model.spin_polarization in (:none, :spinless)
         ρspin = nothing
+    elseif model.spin_polarization == :collinear
+        ρspin = zeros(T, basis.fft_size...)
+    elseif model.spin_polarization == :full
+        z = zeros(T, basis.fft_size...)
+        ρspin = (z, z, z)
     else
-        ρspin = zeros_like(G_vectors(basis), T, basis.fft_size...)
+        error("Unknown spin polarization: $(model.spin_polarization)")
     end
     ρ_from_total_and_spin(ρtot, ρspin)
+end
+
+# === HELPER FOR XC FORCES ===
+function atomic_density_form_factors(basis::PlaneWaveBasis{T}, atomic_density) where {T}
+    n_groups = length(basis.model.atom_groups)
+    Gs = G_vectors_cart(basis)
+    form_factors = zeros(Complex{T}, length(Gs), n_groups)
+    
+    for (ig, group) in enumerate(basis.model.atom_groups)
+        element = basis.model.atoms[first(group)]
+        if element isa ElementPsp
+             for (iG, G) in enumerate(Gs)
+                 if atomic_density isa CoreDensity
+                     form_factors[iG, ig] = eval_psp_density_core_fourier(element.psp, norm(G))
+                 else
+                     form_factors[iG, ig] = eval_psp_density_valence_fourier(element.psp, norm(G))
+                 end
+             end
+        end
+    end
+    iG2ifnorm = 1:length(Gs) 
+    return form_factors, iG2ifnorm
 end

@@ -217,11 +217,25 @@ function PlaneWaveBasis(model::Model{T}, Ecut::Real, fft_size::Tuple{Int, Int, I
     )
     kpoints = build_kpoints(model, fft_size, kcoords_global[krange_thisproc1], Ecut;
                             variational, architecture)
-    # kpoints is now possibly twice the size of krange. Make things consistent
-    if model.n_spin_components == 1
+
+    # CHANGED: === [FIX 1] FILTER K-POINTS FOR SOC ===
+    # build_kpoints generates 4 sets of kpoints for :full spin.
+    # We only want 1 set (like spinless) because spinor logic handles the rest.
+    if model.spin_polarization == :full
+        filter!(kpt -> kpt.spin == 1, kpoints)
+    end
+    # =======================================
+
+    # CHANGED: === [FIX 2] CORRECT WEIGHT DUPLICATION LOGIC ===
+    # Old code checked (n_spin_components == 1). 
+    # New code checks (spin_polarization != :collinear).
+    # This prevents SOC (4 components) from duplicating weights.
+    if model.spin_polarization != :collinear
+        # Case: :spinless OR :full (SOC) -> Single grid
         kweights = kweights_global[krange_thisproc1]
         krange_allprocs = [[range] for range in krange_allprocs1]
     else
+        # Case: :collinear -> Double grid (Up/Down)
         kweights = vcat(kweights_global[krange_thisproc1],
                         kweights_global[krange_thisproc1])
         krange_allprocs = [[range, n_kpt .+ range] for range in krange_allprocs1]
@@ -229,7 +243,11 @@ function PlaneWaveBasis(model::Model{T}, Ecut::Real, fft_size::Tuple{Int, Int, I
     krange_thisproc = krange_allprocs[1 + MPI.Comm_rank(comm_kpts)]
     krange_thisproc_allspin = reduce(vcat, krange_thisproc)
 
-    @assert mpi_sum(sum(kweights), comm_kpts) ≈ model.n_spin_components
+    # ===CHANGED: [FIX 3] CORRECT ASSERTION ===
+    # Ensure weights sum to 1.0 for SOC, not 4.0.
+    expected_weight_sum = model.spin_polarization == :collinear ? 2 : 1
+    @assert mpi_sum(sum(kweights), comm_kpts) ≈ expected_weight_sum
+    # =================================
     @assert length(kpoints) == length(kweights)
     @assert length(kpoints) == sum(length, krange_thisproc)
     @assert length(kpoints) == length( krange_thisproc_allspin)

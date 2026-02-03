@@ -5,6 +5,25 @@ Nonlocal term coming from norm-conserving pseudopotentials in Kleinmann-Bylander
     ∑_a ∑_{ij} ∑_{n} f_n \braket{ψ_n}{{\rm proj}_{ai}} D_{ij} \braket{{\rm proj}_{aj}}{ψ_n}.
 ```
 """
+
+# Clebsch-Gordan coefficients for coupling l and s=1/2 to j
+# Returns (c_up, c_dn) such that |ljm> = c_up |l, m-1/2, ↑> + c_dn |l, m+1/2, ↓>
+function get_spinor_coeffs(l, j, m)
+    # Case j = l + 1/2
+    if abs(j - (l + 0.5)) < 1e-4
+        c_up = sqrt((l + m + 0.5) / (2l + 1))
+        c_dn = sqrt((l - m + 0.5) / (2l + 1))
+        return (c_up, c_dn)
+    # Case j = l - 1/2
+    elseif abs(j - (l - 0.5)) < 1e-4 && l > 0
+        c_up = -sqrt((l - m + 0.5) / (2l + 1))
+        c_dn =  sqrt((l + m + 0.5) / (2l + 1))
+        return (c_up, c_dn)
+    else
+        return (0.0, 0.0)
+    end
+end
+
 struct AtomicNonlocal end
 function (::AtomicNonlocal)(basis::PlaneWaveBasis{T}) where {T}
     model = basis.model
@@ -18,7 +37,8 @@ function (::AtomicNonlocal)(basis::PlaneWaveBasis{T}) where {T}
     isempty(psp_groups) && return TermNoop()
     ops = map(basis.kpoints) do kpt
         P = build_projection_vectors(basis, kpt, psps, psp_positions)
-        D = build_projection_coefficients(T, psps, psp_positions)
+        # CHANGED: Pass `basis` instead of just `T` to access model.spin_polarization
+        D = build_projection_coefficients(basis, psps, psp_positions) 
         NonlocalOperator(basis, kpt, P, to_device(basis.architecture, D))
     end
     TermAtomicNonlocal(ops)
@@ -65,7 +85,10 @@ end
     for group in psp_groups
         element = model.atoms[first(group)]
 
-        C = to_device(basis.architecture, build_projection_coefficients(T, element.psp))
+        # CHANGED: === FIX: Pass 'basis' instead of 'T' here ===
+        C = to_device(basis.architecture, build_projection_coefficients(basis, element.psp))
+        # =============================================
+
         for (ik, kpt) in enumerate(basis.kpoints)
             # We compute the forces from the irreductible BZ; they are symmetrized later.
             G_plus_k_cart = to_cpu(Gplusk_vectors_cart(basis, kpt))
@@ -73,8 +96,7 @@ end
             form_factors = to_device(basis.architecture,
                                      build_projector_form_factors(element.psp, G_plus_k_cart))
 
-            # Pre-allocation of large arrays (Noticable performance improvements on
-            # CPU and GPU here)
+            # Pre-allocation of large arrays
             δHψk  = similar(ψ[ik])
             P     = similar(form_factors)
             dPdR  = similar(form_factors)
@@ -105,19 +127,25 @@ end
 # The ordering of the projector indices is (A,l,m,i), where A is running over all
 # atoms, l, m are AM quantum numbers and i is running over all projectors for a
 # given l. The matrix is block-diagonal with non-zeros only if A, l and m agree.
-function build_projection_coefficients(T, psps, psp_positions)
-    # TODO In the current version the proj_coeffs still has a lot of zeros.
-    #      One could improve this by storing the blocks as a list or in a
-    #      BlockDiagonal data structure
-    n_proj = count_n_proj(psps, psp_positions)
+# Wrapper that dispatches based on Basis
+# CHANGED: changed in order to enable the SOC and non-collinear calculation
+function build_projection_coefficients(basis::PlaneWaveBasis{T}, psps, psp_positions) where {T}
+    # Calculate total size
+    n_proj_scalar = count_n_proj(psps, psp_positions)
+    is_soc = (basis.model.spin_polarization == :full)
+    n_proj = is_soc ? 2 * n_proj_scalar : n_proj_scalar
+
     proj_coeffs = zeros(T, n_proj, n_proj)
 
     count = 0
     for (psp, positions) in zip(psps, psp_positions), _ in positions
-        n_proj_psp = count_n_proj(psp)
-        block = count+1:count+n_proj_psp
-        proj_coeffs[block, block] = build_projection_coefficients(T, psp)
-        count += n_proj_psp
+        # Get block for this atom
+        D_atom = build_projection_coefficients(basis, psp)
+        n_p = size(D_atom, 1)
+        
+        block = count+1:count+n_p
+        proj_coeffs[block, block] = D_atom
+        count += n_p
     end
     @assert count == n_proj
 
@@ -128,19 +156,90 @@ end
 # The ordering of the projector indices is (l,m,i), where l, m are the
 # AM quantum numbers and i is running over all projectors for a given l.
 # The matrix is block-diagonal with non-zeros only if l and m agree.
-function build_projection_coefficients(T::Type, psp::NormConservingPsp)
-    n_proj = count_n_proj(psp)
-    proj_coeffs = zeros(T, n_proj, n_proj)
-    count = 0
-    for l = 0:psp.lmax, _ = -l:l
-        n_proj_l = count_n_proj_radial(psp, l)  # Number of i's
-        range = count .+ (1:n_proj_l)
-        proj_coeffs[range, range] = psp.h[l + 1]
-        count += n_proj_l
-    end
-    proj_coeffs
-end
+# Atom-specific builder
 
+# CHANGED: changed in order to enable the SOC and non-collinear calculation
+# Atom-specific builder
+function build_projection_coefficients(basis::PlaneWaveBasis{T}, psp::NormConservingPsp) where {T}
+    is_soc = (basis.model.spin_polarization == :full)
+    
+    if is_soc
+        # === SOC Construction ===
+        n_proj_soc = sum(l -> count_n_proj_radial(psp, l) * 2 * (2l+1), 0:psp.lmax; init=0)
+        
+        proj_coeffs = zeros(T, n_proj_soc, n_proj_soc)
+        count = 0
+        
+        for l = 0:psp.lmax
+            n_rad = count_n_proj_radial(psp, l)
+            soc_data = get_soc_coupling(psp, l) 
+            
+            # Fallback scalar if no SOC data
+            h_scalar = psp.h[l+1] 
+            
+            for i = 1:n_rad
+                # Relativistic loop: j = l-1/2, l+1/2
+                js = (l == 0) ? [0.5] : [l - 0.5, l + 0.5]
+                
+                for (j_idx, j) in enumerate(js)
+                    # Determine energy D_ij for this state
+                    h_val = zero(T)
+                    
+                    if !isnothing(soc_data)
+                        target_vec = nothing
+                        
+                        if l == 0
+                            # For l=0, j=1/2. Check index 1 or 2.
+                            # FIX: Added '&& length(...) >= i' to prevent BoundsError
+                            if length(soc_data) >= 1 && length(soc_data[1]) >= i
+                                target_vec = soc_data[1]
+                            elseif length(soc_data) >= 2 && length(soc_data[2]) >= i
+                                target_vec = soc_data[2]
+                            end
+                        else
+                            # For l > 0
+                            # FIX: Added '&& length(...) >= i'
+                            if length(soc_data) >= j_idx && length(soc_data[j_idx]) >= i
+                                target_vec = soc_data[j_idx]
+                            end
+                        end
+                        
+                        if !isnothing(target_vec)
+                            h_val = target_vec[i]
+                        else
+                            # Fallback to scalar if SOC data is missing/short for this radial index
+                            h_val = h_scalar[i,i]
+                        end
+                    else
+                        # Fallback if no SOC data at all
+                        h_val = h_scalar[i,i]
+                    end
+                    
+                    # Fill diagonal for all mj (-j to j)
+                    deg = Int(2*j + 1)
+                    for _ in 1:deg
+                        count += 1
+                        proj_coeffs[count, count] = h_val
+                    end
+                end
+            end
+        end
+        return proj_coeffs
+
+    else
+        # === SCALAR Construction (Original Logic) ===
+        n_proj = count_n_proj(psp)
+        proj_coeffs = zeros(T, n_proj, n_proj)
+        count = 0
+        for l = 0:psp.lmax, _ = -l:l
+            n_proj_l = count_n_proj_radial(psp, l)
+            range = count .+ (1:n_proj_l)
+            proj_coeffs[range, range] = psp.h[l + 1]
+            count += n_proj_l
+        end
+        return proj_coeffs
+    end
+end
 
 @doc raw"""
 Build projection vectors for a atoms array generated by term_nonlocal
@@ -168,35 +267,92 @@ function build_projection_vectors(basis::PlaneWaveBasis{T}, kpt::Kpoint,
                                   psps::AbstractVector{<: NormConservingPsp},
                                   psp_positions) where {T}
     unit_cell_volume = basis.model.unit_cell_volume
-    n_proj = count_n_proj(psps, psp_positions)
+    n_proj_scalar = count_n_proj(psps, psp_positions)
     n_G    = length(G_vectors(basis, kpt))
-    proj_vectors = zeros(Complex{eltype(psp_positions[1][1])}, n_G, n_proj)
+    
+    # SOC Check
+    is_soc = (basis.model.spin_polarization == :full)
+    # If SOC, we have 2x the projectors (spin-orbitals) and vectors are 2x long (spinors)
+    n_proj = is_soc ? 2 * n_proj_scalar : n_proj_scalar
+    vec_len = is_soc ? 2 * n_G : n_G
+
+    proj_vectors = zeros(Complex{eltype(psp_positions[1][1])}, vec_len, n_proj)
     G_plus_k = to_cpu(Gplusk_vectors(basis, kpt))
 
-    # Compute the columns of proj_vectors = 1/√Ω \hat proj_i(k+G)
-    # Since the proj_i are translates of each others, \hat proj_i(k+G) decouples as
-    # \hat proj_i(p) = ∫ proj(r-R) e^{-ip·r} dr = e^{-ip·R} \hat proj(p).
-    # The first term is the structure factor, the second the form factor.
-    offset = 0  # offset into proj_vectors
+    # Helpers for SOC indexing
+    # We need to map standard (l,m) form factors to relativistic (l,j,mj)
+    
+    offset = 0 
     for (psp, positions) in zip(psps, psp_positions)
-        # Compute position-independent form factors
+        # Compute position-independent form factors (scalar radial part)
         G_plus_k_cart = to_cpu(Gplusk_vectors_cart(basis, kpt))
         form_factors = build_projector_form_factors(psp, G_plus_k_cart)
 
-        # Combine with structure factors
         for r in positions
-            # k+G in this formula can also be G, this only changes an unimportant phase factor
             structure_factors = map(p -> cis2pi(-dot(p, r)), G_plus_k)
-            @views for iproj = 1:count_n_proj(psp)
-                proj_vectors[:, offset+iproj] .=
-                    structure_factors .* form_factors[:, iproj] ./ sqrt(unit_cell_volume)
+            
+            # === SOC BRANCH ===
+            if is_soc
+                current_proj_idx = 0
+                for l = 0:psp.lmax
+                    n_proj_l = count_n_proj_radial(psp, l)
+                    for i = 1:n_proj_l
+                        # Iterate Relativistic j states: l-1/2 and l+1/2
+                        js = (l == 0) ? [0.5] : [l - 0.5, l + 0.5]
+                        
+                        for j in js
+                            # Iterate mj from -j to j
+                            for mj = -j:1.0:j
+                                (c_up, c_dn) = get_spinor_coeffs(l, j, mj)
+                                
+                                # We need to grab the scalar form factor for m_orb = mj +/- 0.5
+                                # build_projector_form_factors packs them as:
+                                # Offset(l) + Offset(i) + (m + l + 1)
+                                
+                                # Helper to get scalar column index
+                                function get_ff_col(m_orb)
+                                    if abs(m_orb) > l; return 0; end
+                                    base_l = sum(x -> count_n_proj(psp, x), 0:l-1; init=0)
+                                    base_i = (i-1) * (2l+1)
+                                    return base_l + base_i + (Int(m_orb) + l + 1)
+                                end
+
+                                col_idx = offset + current_proj_idx + 1
+
+                                # --- Construct Up Component ---
+                                m_up = mj - 0.5
+                                idx_up = get_ff_col(m_up)
+                                if idx_up > 0
+                                    @views proj_vectors[1:n_G, col_idx] .+= 
+                                        c_up .* structure_factors .* form_factors[:, idx_up] ./ sqrt(unit_cell_volume)
+                                end
+
+                                # --- Construct Down Component ---
+                                m_dn = mj + 0.5
+                                idx_dn = get_ff_col(m_dn)
+                                if idx_dn > 0
+                                    @views proj_vectors[n_G+1:end, col_idx] .+= 
+                                        c_dn .* structure_factors .* form_factors[:, idx_dn] ./ sqrt(unit_cell_volume)
+                                end
+                                
+                                current_proj_idx += 1
+                            end
+                        end
+                    end
+                end
+                offset += current_proj_idx
+
+            else
+                # === SCALAR BRANCH ===
+                @views for iproj = 1:count_n_proj(psp)
+                    proj_vectors[:, offset+iproj] .=
+                        structure_factors .* form_factors[:, iproj] ./ sqrt(unit_cell_volume)
+                end
+                offset += count_n_proj(psp)
             end
-            offset += count_n_proj(psp)
         end
     end
-    @assert offset == n_proj
-
-    # Offload potential values to a device (like a GPU)
+    
     to_device(basis.architecture, proj_vectors)
 end
 
@@ -266,7 +422,9 @@ end
 function build_projection_coefficients(basis::PlaneWaveBasis{T}, psp_groups) where {T}
     psps          = [basis.model.atoms[first(group)].psp for group in psp_groups]
     psp_positions = [basis.model.positions[group] for group in psp_groups]
-    build_projection_coefficients(T, psps, psp_positions)
+    
+    # CHANGED: === FIX: Pass 'basis' instead of 'T' ===
+    build_projection_coefficients(basis, psps, psp_positions)
 end
 function build_projection_vectors(basis::PlaneWaveBasis, kpt::Kpoint,
                                   psp_groups::AbstractVector{<: AbstractVector{<: Int}},

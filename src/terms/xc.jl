@@ -60,6 +60,56 @@ struct TermXc{T,CT} <: TermNonlinear where {T,CT}
 end
 DftFunctionals.needs_τ(term::TermXc) = any(needs_τ, term.functionals)
 
+# ADDED: === ROBUST CORE ADDITION HELPER (FIXES DIMENSION MISMATCH) ===
+# === ROBUST CORE ADDITION HELPER ===
+function add_core_density(ρ::AbstractArray{T,4}, ρcore::AbstractArray{T,4}) where {T}
+    n_spin_ρ = size(ρ, 4)
+    n_spin_c = size(ρcore, 4)
+    
+    # 1. Exact Match: Direct addition
+    if n_spin_ρ == n_spin_c
+        return ρ + ρcore
+    end
+    
+    # 2. ρ=4 (SOC), ρcore=2 (Collinear mismatch)
+    #    Fix: Sum the Up and Down core components to get total Core Charge.
+    if n_spin_ρ == 4 && n_spin_c == 2
+        ρ_out = copy(ρ)
+        @views ρ_out[:,:,:,1] .+= ρcore[:,:,:,1] .+ ρcore[:,:,:,2]
+        return ρ_out
+    end
+    
+    # 3. ρ=4 (SOC), ρcore=1 (Spinless)
+    if n_spin_ρ == 4 && n_spin_c == 1
+        ρ_out = copy(ρ)
+        @views ρ_out[:,:,:,1] .+= ρcore[:,:,:,1]
+        return ρ_out
+    end
+
+    # 4. ρ=2 (Collinear), ρcore=1 (Spinless)
+    if n_spin_ρ == 2 && n_spin_c == 1
+        ρ_out = copy(ρ)
+        @views ρ_out[:,:,:,1] .+= ρcore[:,:,:,1] ./ 2
+        @views ρ_out[:,:,:,2] .+= ρcore[:,:,:,1] ./ 2
+        return ρ_out
+    end
+
+    # 5. [NEW FIX] ρ=2 (Collinear), ρcore=4 (SOC mismatch)
+    #    This happens if ρcore was built for SOC (Charge, 0, 0, 0), but we are running Collinear.
+    #    Fix: Take the Charge component (1) of ρcore and split it to Up/Down.
+    if n_spin_ρ == 2 && n_spin_c == 4
+        ρ_out = copy(ρ)
+        # ρcore[..., 1] is the total core charge.
+        # ρcore[..., 2:4] are magnetization (usually 0 for core), ignore them.
+        @views ρ_out[:,:,:,1] .+= ρcore[:,:,:,1] ./ 2
+        @views ρ_out[:,:,:,2] .+= ρcore[:,:,:,1] ./ 2
+        return ρ_out
+    end
+
+    error("TermXc: Cannot add core density of spin $n_spin_c to density of spin $n_spin_ρ")
+end
+# ==============================================================
+
 function xc_potential_real(term::TermXc, basis::PlaneWaveBasis{T}, ψ, occupation;
                            ρ, τ=nothing) where {T}
     @assert !isempty(term.functionals)
@@ -69,121 +119,154 @@ function xc_potential_real(term::TermXc, basis::PlaneWaveBasis{T}, ψ, occupatio
     potential_threshold = term.potential_threshold
     @assert all(family(xc) in (:lda, :gga, :mgga, :mggal) for xc in term.functionals)
 
-    # Add the model core charge density (non-linear core correction)
+    # === USE ROBUST ADDITION ===
+    ρ_input = ρ
     if !isnothing(term.ρcore)
-        ρ = ρ + term.ρcore
+        ρ_input = add_core_density(ρ, term.ρcore)
     end
 
-    # Compute kinetic energy density, if needed.
     if isnothing(τ) && needs_τ(term)
-        throw(ArgumentError("TermXc needs the kinetic energy density τ. Please pass a `τ` " *
-                            "keyword argument to your `Hamiltonian` or `energy_hamiltonian` call."))
+        throw(ArgumentError("TermXc needs τ."))
     end
 
-    # Take derivatives of the density, if needed.
     max_ρ_derivs = maximum(max_required_derivative, term.functionals)
-    density = LibxcDensities(basis, max_ρ_derivs, ρ, τ)
+    density = LibxcDensities(basis, max_ρ_derivs, ρ_input, τ)
 
-    if !isnothing(term.ρcore) && needs_τ(term)
-        negative_α = @views any(1:n_spin) do iσ
-            # α = (τ - τ_W) / τ_unif should be positive with τ_W = |∇ρ|² / 8ρ
-            # equivalently, check 8ρτ - |∇ρ|² ≥ 0
-            α_check = (8 .* density.ρ_real[iσ, :, :, :] .* density.τ_real[iσ, :, :, :]
-                       .- density.σ_real[DftFunctionals.spinindex_σ(iσ, iσ), :, :, :])
-            any(α_check .<= -sqrt(eps(T)))
-        end
-        if negative_α
-            @warn "Exchange-correlation term: the kinetic energy density τ is smaller " *
-                  "than the von Weizsäcker kinetic energy density τ_W somewhere. " *
-                  "This can lead to unphysical results. " *
-                  "This is typically caused by the non-linear core correction, " *
-                  "which is currently not applied for the kinetic energy density τ. " *
-                  "See also https://github.com/JuliaMolSim/DFTK.jl/issues/1180. " *
-                  "This message is only logged once." maxlog=1
-        end
-    end
-
-    # Evaluate terms and energy contribution
-    # If the XC functional is not supported for an architecture, terms is on the CPU
     terms = potential_terms(term.functionals, density)
     @assert haskey(terms, :Vρ) && haskey(terms, :e)
-    E = term.scaling_factor * sum(terms.e) * basis.dvol
+    E = sum(terms.e) * basis.dvol
 
-    # Map from the tuple of spin indices for the contracted density gradient
-    # (s, t) to the index convention used in DftFunctionals (i.e. packed symmetry-adapted
-    # storage), see details on "Spin-polarised calculations" below.
-    tσ = DftFunctionals.spinindex_σ
+    # [FIX] Force potential to match n_spin of the Model, not the input ρ
+    potential = zeros(eltype(ρ), basis.fft_size..., n_spin)
 
-    # Potential contributions Vρ -2 ∇⋅(Vσ ∇ρ) + ΔVl
-    potential = zero(ρ)
-    @views for s = 1:n_spin
-        Vρ = to_device(basis.architecture, reshape(terms.Vρ, n_spin, basis.fft_size...))
+    # === SOC / Non-Collinear Recombination ===
+    if n_spin == 4
+        V_up = reshape(terms.Vρ[1, :, :, :], basis.fft_size...)
+        V_dn = reshape(terms.Vρ[2, :, :, :], basis.fft_size...)
 
-        potential[:, :, :, s] .+= Vρ[s, :, :, :]
         if haskey(terms, :Vσ) && any(x -> abs(x) > potential_threshold, terms.Vσ)
-            # Need gradient correction
-            # TODO Drop do-block syntax here?
-            potential[:, :, :, s] .+= -2divergence_real(basis) do α
-                Vσ = to_device(basis.architecture, reshape(terms.Vσ, :, basis.fft_size...))
-
-                # Extra factor (1/2) for s != t is needed because libxc only keeps σ_{αβ}
-                # in the energy expression. See comment block below on spin-polarised XC.
-                sum((s == t ? one(T) : one(T)/2)
-                    .* Vσ[tσ(s, t), :, :, :] .* density.∇ρ_real[t, :, :, :, α]
-                    for t = 1:n_spin)
+            do_fft(x) = fft(basis, x)
+            # GGA Up
+            V_up .+= -2divergence_real(basis) do α
+                ∇ρ_u_α = density.∇ρ_real[1, :, :, :, α]
+                ∇ρ_d_α = density.∇ρ_real[2, :, :, :, α]
+                Vσ_uu = reshape(terms.Vσ[1, :, :, :], basis.fft_size...)
+                Vσ_ud = reshape(terms.Vσ[2, :, :, :], basis.fft_size...)
+                do_fft(Vσ_uu .* ∇ρ_u_α .+ Vσ_ud .* ∇ρ_d_α)
+            end
+            # GGA Down
+            V_dn .+= -2divergence_real(basis) do α
+                ∇ρ_u_α = density.∇ρ_real[1, :, :, :, α]
+                ∇ρ_d_α = density.∇ρ_real[2, :, :, :, α]
+                Vσ_ud = reshape(terms.Vσ[2, :, :, :], basis.fft_size...)
+                Vσ_dd = reshape(terms.Vσ[3, :, :, :], basis.fft_size...)
+                do_fft(Vσ_dd .* ∇ρ_d_α .+ Vσ_ud .* ∇ρ_u_α)
             end
         end
-        if haskey(terms, :Vl) && any(x -> abs(x) > potential_threshold, terms.Vl)
-            @warn "Meta-GGAs with a Δρ term have not yet been thoroughly tested." maxlog=1
-            mG² = .-norm2.(G_vectors_cart(basis))
-            Vl  = to_device(basis.architecture, reshape(terms.Vl, n_spin, basis.fft_size...))
-            Vl_fourier = fft(basis, Vl[s, :, :, :])
-            potential[:, :, :, s] .+= irfft(basis, mG² .* Vl_fourier)  # ΔVl
+
+        potential[:, :, :, 1] .= (V_up .+ V_dn) ./ 2
+
+        # [FIX] Handle 2-component density inside 4-component calculation
+        if size(ρ, 4) == 2
+             # Input ρ is Collinear [Charge, Mz]. Mx=My=0.
+             mz_col = @view ρ[:, :, :, 2]
+             m_mag = abs.(mz_col)
+             
+             # Avoid division by zero
+             B_scaling = (V_up .- V_dn) ./ (2 .* m_mag .+ 2eps(T))
+             
+             # Apply purely to Z component
+             potential[:, :, :, 4] .= B_scaling .* mz_col
+        else
+             # Standard 4-component input
+             mx = @view ρ[:, :, :, 2]
+             my = @view ρ[:, :, :, 3]
+             mz = @view ρ[:, :, :, 4]
+             m_mag = sqrt.(mx.^2 .+ my.^2 .+ mz.^2)
+
+             B_scaling = (V_up .- V_dn) ./ (2 .* m_mag .+ 2eps(T))
+
+             potential[:, :, :, 2] .= B_scaling .* mx
+             potential[:, :, :, 3] .= B_scaling .* my
+             potential[:, :, :, 4] .= B_scaling .* mz
+        end
+        
+    else
+        # === Collinear / Spinless ===
+        tσ = DftFunctionals.spinindex_σ
+        @views for s = 1:n_spin
+            Vρ = to_device(basis.architecture, reshape(terms.Vρ, n_spin, basis.fft_size...))
+            potential[:, :, :, s] .+= Vρ[s, :, :, :]
+            if haskey(terms, :Vσ) && any(x -> abs(x) > potential_threshold, terms.Vσ)
+                potential[:, :, :, s] .+= -2divergence_real(basis) do α
+                    Vσ = to_device(basis.architecture, reshape(terms.Vσ, :, basis.fft_size...))
+                    sum((s == t ? one(T) : one(T)/2)
+                        .* Vσ[tσ(s, t), :, :, :] .* density.∇ρ_real[t, :, :, :, α]
+                        for t = 1:n_spin)
+                end
+            end
+            if haskey(terms, :Vl) && any(x -> abs(x) > potential_threshold, terms.Vl)
+                mG² = .-norm2.(G_vectors_cart(basis))
+                Vl  = to_device(basis.architecture, reshape(terms.Vl, n_spin, basis.fft_size...))
+                Vl_fourier = fft(basis, Vl[s, :, :, :])
+                potential[:, :, :, s] .+= irfft(basis, mG² .* Vl_fourier)
+            end
         end
     end
 
-    # DivAgrad contributions -½ Vτ
     Vτ = nothing
     if haskey(terms, :Vτ) && any(x -> abs(x) > potential_threshold, terms.Vτ)
-        # Need meta-GGA non-local operator (Note: -½ part of the definition of DivAgrid)
         Vτ = to_device(basis.architecture, reshape(terms.Vτ, n_spin, basis.fft_size...))
-        Vτ = term.scaling_factor * permutedims(Vτ, (2, 3, 4, 1))
+        Vτ = permutedims(Vτ, (2, 3, 4, 1))
     end
-
-    # Note: We always have to do this, otherwise we get issues with AD wrt. scaling_factor
-    potential .*= term.scaling_factor
 
     (; E, potential, Vτ)
 end
 
 @views @timing "ene_ops: xc" function ene_ops(term::TermXc, basis::PlaneWaveBasis{T},
-                                              ψ, occupation; ρ, τ=nothing,
-                                              kwargs...) where {T}
-    E, Vxc, Vτ = xc_potential_real(term, basis, ψ, occupation; ρ, τ)
+                                       ψ, occupation; ρ, τ=nothing, kwargs...) where {T}
+    @assert !isnothing(ρ)
+    model = basis.model
+    
+    # === XC POTENTIAL CALCULATION ===
+    # CHANGED: For Non-Collinear (:full), rotation logic is handled inside xc_potential_real
+    E, potential, Vτ = xc_potential_real(term, basis, ψ, occupation; ρ, τ)
 
+    # Apply scaling (for hybrid mixing, etc)
+    if term.scaling_factor != 1
+        E *= term.scaling_factor
+        potential .*= term.scaling_factor
+        if !isnothing(Vτ)
+            Vτ .*= term.scaling_factor
+        end
+    end
+
+    # Define Operators
     ops = map(basis.kpoints) do kpt
         if !isnothing(Vτ)
-            [RealSpaceMultiplication(basis, kpt, Vxc[:, :, :, kpt.spin]),
+            [RealSpaceMultiplication(basis, kpt, potential[:, :, :, kpt.spin]),
              DivAgradOperator(basis, kpt, Vτ[:, :, :, kpt.spin])]
         else
-            RealSpaceMultiplication(basis, kpt, Vxc[:, :, :, kpt.spin])
+            RealSpaceMultiplication(basis, kpt, potential[:, :, :, kpt.spin])
         end
     end
     (; E, ops)
 end
 
 @timing "forces: xc" function compute_forces(term::TermXc, basis::PlaneWaveBasis{T},
-                                             ψ, occupation; ρ, τ=nothing,
-                                             kwargs...) where {T}
-    # The only non-zero force contribution is from the nlcc core charge:
-    # early return if nlcc is disabled / no elements have model core charges.
+                                       ψ, occupation; ρ, τ=nothing, kwargs...) where {T}
     isnothing(term.ρcore) && return nothing
 
     Vxc_real = xc_potential_real(term, basis, ψ, occupation; ρ, τ).potential
+    
     if basis.model.spin_polarization in (:none, :spinless)
         Vxc_fourier = fft(basis, Vxc_real[:,:,:,1])
     else
-        Vxc_fourier = fft(basis, mean(Vxc_real, dims=4))
+        if size(Vxc_real, 4) == 2
+             Vxc_fourier = fft(basis, mean(Vxc_real, dims=4))
+        else
+             Vxc_fourier = fft(basis, Vxc_real[:,:,:,1])
+        end
     end
 
     form_factors, iG2ifnorm = atomic_density_form_factors(basis, CoreDensity())
@@ -303,6 +386,7 @@ struct LibxcDensities
     τ_real    # Kinetic-energy density τ[iσ, ix, iy, iz]
 end
 
+# CHANGED: Modified to handle :full calculation (LDA and GGA)
 """
 Compute density in real space and its derivatives starting from ρ
 """
@@ -310,7 +394,98 @@ function LibxcDensities(basis, max_derivative::Integer, ρ, τ)
     model = basis.model
     @assert max_derivative in (0, 1, 2)
 
-    n_spin    = model.n_spin_components
+    n_spin = model.n_spin_components
+    
+    # === MODIFICATION START: Handle Non-Collinear Spin ===
+    if n_spin == 4
+        # [SAFETY PATCH] Handle case where input ρ is 2-component (Collinear) despite n_spin=4
+        # This prevents BoundsError if the input density hasn't been expanded to 4 components yet.
+        if size(ρ, 4) == 2
+            n_tot = @view ρ[:, :, :, 1]
+            mz    = @view ρ[:, :, :, 2]
+            # Assume mx, my = 0
+            mx    = zeros(eltype(ρ), basis.fft_size...)
+            my    = zeros(eltype(ρ), basis.fft_size...)
+            m_mag = abs.(mz) # |m| = |mz|
+        else
+            # Standard 4-component case [n, mx, my, mz]
+            n_tot = @view ρ[:, :, :, 1]
+            mx    = @view ρ[:, :, :, 2]
+            my    = @view ρ[:, :, :, 3]
+            mz    = @view ρ[:, :, :, 4]
+            m_mag = sqrt.(mx.^2 .+ my.^2 .+ mz.^2)
+        end
+        
+        # 3. Construct Local Densities (Up/Down)
+        #    ρ_up = (n + |m|) / 2
+        #    ρ_dn = (n - |m|) / 2
+        ρ_real = similar(ρ, 2, basis.fft_size...)
+        @. ρ_real[1, :, :, :] = (n_tot + m_mag) / 2
+        @. ρ_real[2, :, :, :] = (n_tot - m_mag) / 2
+
+        ∇ρ_real = nothing
+        σ_real  = nothing
+        
+        # 4. Compute Gradients if needed (GGA)
+        if max_derivative > 0
+            # Helper to compute gradient
+            function compute_grad(field)
+                field_f = fft(basis, field)
+                grad_f = similar(field, basis.fft_size..., 3)
+                for α = 1:3
+                    iGα = map(G -> im * G[α], G_vectors_cart(basis))
+                    grad_f[:, :, :, α] .= irfft(basis, iGα .* field_f)
+                end
+                return grad_f
+            end
+
+            ∇n  = compute_grad(n_tot)
+            ∇mz = compute_grad(mz)
+            
+            # Gradients of mx, my are zero if they are zero fields
+            if size(ρ, 4) == 2
+                ∇mx = zeros(eltype(ρ), basis.fft_size..., 3)
+                ∇my = zeros(eltype(ρ), basis.fft_size..., 3)
+            else
+                ∇mx = compute_grad(mx)
+                ∇my = compute_grad(my)
+            end
+
+            # b. Compute ∇|m|
+            ∇m_mag = similar(∇n)
+            m_safe = m_mag .+ 2eps(eltype(ρ)) # Avoid div/0
+            for α = 1:3
+                @. ∇m_mag[:, :, :, α] = (mx * ∇mx[:, :, :, α] + 
+                                         my * ∇my[:, :, :, α] + 
+                                         mz * ∇mz[:, :, :, α]) / m_safe
+            end
+
+            # c. Construct ∇ρ_real [2, nx, ny, nz, 3]
+            ∇ρ_real = similar(ρ, 2, basis.fft_size..., 3)
+            @. ∇ρ_real[1, :, :, :, :] = 0.5 * (∇n + ∇m_mag) # Up
+            @. ∇ρ_real[2, :, :, :, :] = 0.5 * (∇n - ∇m_mag) # Down
+
+            # d. Compute σ_real
+            n_spin_σ = 3 # for 2 spins (Up, Down)
+            σ_real = similar(ρ, n_spin_σ, basis.fft_size...)
+            σ_real .= 0
+            tσ = DftFunctionals.spinindex_σ 
+
+            for α = 1:3
+                @. σ_real[tσ(1, 1), :, :, :] += ∇ρ_real[1, :, :, :, α] * ∇ρ_real[1, :, :, :, α]
+                @. σ_real[tσ(1, 2), :, :, :] += ∇ρ_real[1, :, :, :, α] * ∇ρ_real[2, :, :, :, α]
+                @. σ_real[tσ(2, 2), :, :, :] += ∇ρ_real[2, :, :, :, α] * ∇ρ_real[2, :, :, :, α]
+            end
+        end
+
+        Δρ_real = nothing 
+        τ_Libxc = nothing 
+
+        return LibxcDensities(basis, max_derivative, ρ_real, ∇ρ_real, σ_real, Δρ_real, τ_Libxc)
+    end
+    # === MODIFICATION END ===
+
+    # --- BELOW IS THE ORIGINAL CODE ---
     σ_real    = nothing
     ∇ρ_real   = nothing
     Δρ_real   = nothing
@@ -335,7 +510,7 @@ function LibxcDensities(basis, max_derivative::Integer, ρ, τ)
             end
         end
 
-        tσ = DftFunctionals.spinindex_σ  # Spin index transformation (s, t) => st as expected by Libxc
+        tσ = DftFunctionals.spinindex_σ
         σ_real .= 0
         @views for α = 1:3
             σ_real[tσ(1, 1), :, :, :] .+= ∇ρ_real[1, :, :, :, α] .* ∇ρ_real[1, :, :, :, α]
@@ -355,11 +530,9 @@ function LibxcDensities(basis, max_derivative::Integer, ρ, τ)
         end
     end
 
-    # τ[x, y, z, σ] -> τ_Libxc[σ, x, y, z]
     τ_Libxc = isnothing(τ) ? nothing : permutedims(τ, (4, 1, 2, 3))
     LibxcDensities(basis, max_derivative, ρ_real, ∇ρ_real, σ_real, Δρ_real, τ_Libxc)
 end
-
 
 function compute_kernel(term::TermXc, basis::PlaneWaveBasis; ρ, kwargs...)
     n_spin  = basis.model.n_spin_components

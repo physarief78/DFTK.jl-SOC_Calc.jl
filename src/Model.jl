@@ -189,7 +189,10 @@ function Model(lattice::AbstractMatrix{Tstatic},
     # Spin polarization
     spin_polarization in (:none, :collinear, :full, :spinless) ||
         error("Only :none, :collinear, :full and :spinless allowed for spin_polarization")
-    spin_polarization == :full && error("Full spin polarization not yet supported")
+    #--------------------------------    
+    # spin_polarization == :full && error("Full spin polarization not yet supported")
+    # commented to enable :full computation
+    #-------------------------------
     !isempty(magnetic_moments) && !(spin_polarization in (:collinear, :full)) && @warn(
         "Non-empty magnetic_moments on a Model without spin polarization detected."
     )
@@ -349,8 +352,9 @@ end
 """
 Maximal occupation of a state (2 for non-spin-polarized electrons, 1 otherwise).
 """
+# Added the :full support calculation
 function filled_occupation(model)
-    if model.spin_polarization in (:spinless, :collinear)
+    if model.spin_polarization in (:spinless, :collinear, :full)
         return 1
     elseif model.spin_polarization == :none
         return 2
@@ -363,11 +367,13 @@ end
 """
 Explicit spin components of the KS orbitals and the density
 """
+# Added the :full spin polarization definition
 function spin_components(spin_polarization::Symbol)
     spin_polarization == :collinear && return (:up, :down  )
     spin_polarization == :none      && return (:both,      )
     spin_polarization == :spinless  && return (:spinless,  )
-    spin_polarization == :full      && return (:undefined, )
+    # The first component is charge density, the next 3 are Mx, My, Mz
+    spin_polarization == :full      && return (:tot, :mx, :my, :mz) 
 end
 spin_components(model::Model) = spin_components(model.spin_polarization)
 

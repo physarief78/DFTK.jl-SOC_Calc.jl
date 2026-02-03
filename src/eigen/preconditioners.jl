@@ -36,10 +36,17 @@ function PreconditionerTPA(basis::PlaneWaveBasis{T}, kpt::Kpoint; default_shift=
     kinetic_term = [t for t in basis.model.term_types if t isa Kinetic]
     isempty(kinetic_term) && error("Preconditioner should be disabled when no Kinetic term is used.")
 
-    # TODO Annoying that one has to recompute the kinetic energies here. Perhaps
-    #      it's better to pass a HamiltonianBlock directly and read the computed values.
     kinetic_term = only(kinetic_term)
     kin = kinetic_energy(kinetic_term, basis.Ecut, Gplusk_vectors_cart(basis, kpt))
+
+    # [CRITICAL FIX] SOC Support
+    # If using Non-Collinear spin (:full), the wavefunction is a spinor (size 2*Ng).
+    # The kinetic energy operator is diagonal and identical for both spinor components.
+    # We must duplicate 'kin' to match the 2*Ng size of the vectors.
+    if basis.model.spin_polarization == :full
+        kin = vcat(kin, kin)
+    end
+
     PreconditionerTPA{T, typeof(kin)}(basis, kpt, kin, nothing, default_shift)
 end
 function PreconditionerTPA(ham::HamiltonianBlock; kwargs...)
