@@ -5,17 +5,86 @@ import Interpolations: interpolate, extrapolate, scale, BSpline, Quadratic, Peri
 Interpolate a density expressed in a basis `basis_in` to a basis `basis_out`.
 This interpolation uses a very basic real-space algorithm, and makes a DWIM-y attempt
 to take into account the fact that `basis_out` can be a supercell of `basis_in`.
+
+[MODIFIED]: Automatically handles spin projection for ALL cases (:none, :collinear, :full).
 """
 function interpolate_density(ρ_in::AbstractArray{T, 4},
                              basis_in::PlaneWaveBasis,
                              basis_out::PlaneWaveBasis) where {T}
-    if basis_in.model.lattice == basis_out.model.lattice
+    # 1. Perform Spatial Interpolation (Grid -> Grid)
+    #    This returns a density with the SAME spin components as ρ_in, but on the new grid.
+    ρ_spatial = if basis_in.model.lattice == basis_out.model.lattice
         @assert size(ρ_in) == (basis_in.fft_size..., basis_in.model.n_spin_components)
         interpolate_density(ρ_in, basis_out.fft_size)
     else
         interpolate_density(ρ_in, basis_in.fft_size, basis_out.fft_size,
                             basis_in.model.lattice, basis_out.model.lattice)
     end
+
+    # 2. Handle Spin Projection
+    n_spin_in  = size(ρ_in, 4)
+    n_spin_out = basis_out.model.n_spin_components
+
+    # --- Case A: No Change (1->1, 2->2, 4->4) ---
+    if n_spin_in == n_spin_out
+        return ρ_spatial
+    end
+
+    # Allocate Output Array
+    ρ_out = zeros(T, size(ρ_spatial)[1:3]..., n_spin_out)
+
+    # --- Case B: Scalar (1) -> Collinear (2) ---
+    # Split non-magnetic density into equal Up/Down
+    if n_spin_in == 1 && n_spin_out == 2
+        ρ_out[:, :, :, 1] .= ρ_spatial[:, :, :, 1] ./ 2
+        ρ_out[:, :, :, 2] .= ρ_spatial[:, :, :, 1] ./ 2
+        return ρ_out
+    end
+
+    # --- Case C: Scalar (1) -> Full (4) ---
+    # Set Total Density, Magnetization is zero
+    if n_spin_in == 1 && n_spin_out == 4
+        ρ_out[:, :, :, 1] .= ρ_spatial[:, :, :, 1]
+        # Mx, My, Mz (indices 2,3,4) remain 0.0
+        return ρ_out
+    end
+
+    # --- Case D: Collinear (2) -> Full (4) ---
+    # Map Up/Down to Total/Mz. (Mx, My = 0)
+    if n_spin_in == 2 && n_spin_out == 4
+        # Total = Up + Down
+        ρ_out[:, :, :, 1] .= ρ_spatial[:, :, :, 1] .+ ρ_spatial[:, :, :, 2]
+        # Mz = Up - Down
+        ρ_out[:, :, :, 4] .= ρ_spatial[:, :, :, 1] .- ρ_spatial[:, :, :, 2]
+        return ρ_out
+    end
+
+    # --- Case E: Collinear (2) -> Scalar (1) ---
+    # Discard magnetization, keep total charge
+    if n_spin_in == 2 && n_spin_out == 1
+        ρ_out[:, :, :, 1] .= ρ_spatial[:, :, :, 1] .+ ρ_spatial[:, :, :, 2]
+        return ρ_out
+    end
+
+    # --- Case F: Full (4) -> Scalar (1) ---
+    # Discard magnetization vector, keep total charge
+    if n_spin_in == 4 && n_spin_out == 1
+        ρ_out[:, :, :, 1] .= ρ_spatial[:, :, :, 1]
+        return ρ_out
+    end
+
+    # --- Case G: Full (4) -> Collinear (2) ---
+    # Project Z-component of magnetization to Up/Down. Discard Mx, My.
+    if n_spin_in == 4 && n_spin_out == 2
+        # ρ_up   = (Total + Mz) / 2
+        ρ_out[:, :, :, 1] .= (ρ_spatial[:, :, :, 1] .+ ρ_spatial[:, :, :, 4]) ./ 2
+        # ρ_down = (Total - Mz) / 2
+        ρ_out[:, :, :, 2] .= (ρ_spatial[:, :, :, 1] .- ρ_spatial[:, :, :, 4]) ./ 2
+        return ρ_out
+    end
+
+    # Fallback
+    error("Automatic interpolation not implemented for spin change: $n_spin_in -> $n_spin_out")
 end
 
 """

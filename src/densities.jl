@@ -230,3 +230,38 @@ function atomic_density_form_factors(basis::PlaneWaveBasis{T}, atomic_density) w
     iG2ifnorm = 1:length(Gs) 
     return form_factors, iG2ifnorm
 end
+
+"""
+Compute the macroscopic magnetization of the system.
+Returns a vector of length 3 (Mx, My, Mz).
+"""
+function compute_macroscopic_magnetization(basis::PlaneWaveBasis, ρ::AbstractArray)
+    # 1. Get volume of one grid point (dVol)
+    #    Total Volume / Number of points
+    dVol = basis.model.unit_cell_volume / prod(basis.fft_size)
+    
+    n_spin = size(ρ, 4)
+    
+    if n_spin == 1
+        # Non-magnetic
+        return [0.0, 0.0, 0.0]
+        
+    elseif n_spin == 2
+        # Collinear: ρ is [Up, Down]
+        # Magnetization density m(r) = ρ_up(r) - ρ_down(r)
+        # Total Moment M = ∫ (ρ_up - ρ_down) dV
+        mag_z = sum(ρ[:, :, :, 1] .- ρ[:, :, :, 2]) * dVol
+        return [0.0, 0.0, mag_z]
+        
+    elseif n_spin == 4
+        # Non-Collinear / SOC: ρ is [Total, Mx, My, Mz]
+        # Total Moment M = ∫ (Mx, My, Mz) dV
+        M_x = sum(ρ[:, :, :, 2]) * dVol
+        M_y = sum(ρ[:, :, :, 3]) * dVol
+        M_z = sum(ρ[:, :, :, 4]) * dVol
+        return [M_x, M_y, M_z]
+        
+    else
+        error("Unknown spin configuration with $n_spin components")
+    end
+end
